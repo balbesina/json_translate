@@ -1,7 +1,9 @@
+# frozen_string_literal: true
+
 module JSONTranslate
   module Translates
-    SUFFIX = "_translations".freeze
-    MYSQL_ADAPTERS = %w[MySQL Mysql2 Mysql2Spatial]
+    SUFFIX = '_translations'
+    MYSQL_ADAPTERS = %w[MySQL Mysql2 Mysql2Spatial].freeze
 
     def translates(*attrs, allow_blank: false)
       include InstanceMethods
@@ -19,7 +21,11 @@ module JSONTranslate
 
       attrs.each do |attr_name|
         define_method attr_name do |**params|
-          read_json_translation(attr_name, **params)
+          if attribute_names.include?(attr_name.to_s)
+            self[attr_name]
+          else
+            read_json_translation(attr_name, **params)
+          end
         end
 
         define_method "#{attr_name}=" do |value|
@@ -38,16 +44,46 @@ module JSONTranslate
           end
         end
 
-        define_singleton_method "with_#{attr_name}_translation" do |value, locale = I18n.locale|
-          quoted_translation_store = connection.quote_column_name("#{attr_name}#{SUFFIX}")
-          translation_hash = { "#{locale}" => value }
+        scope "with_#{attr_name}_translation", ->(value, locale = I18n.locale) {
+          translation_store = arel_table["#{attr_name}#{SUFFIX}"]
+          translation_json = Arel::Nodes.build_quoted({ locale => value }.to_json)
 
           if MYSQL_ADAPTERS.include?(connection.adapter_name)
-            where("JSON_CONTAINS(#{quoted_translation_store}, :translation, '$')", translation: translation_hash.to_json)
+            where(Arel::Nodes::NamedFunction.new(
+                    'JSON_CONTAINS',
+                    [
+                      translation_store,
+                      translation_json,
+                      Arel::Nodes.build_quoted('$')
+                    ]
+                  ))
           else
-            where("#{quoted_translation_store} @> :translation::jsonb", translation: translation_hash.to_json)
+            where(Arel::Nodes::InfixOperation.new(
+                    '@>',
+                    translation_store,
+                    Arel::Nodes::NamedFunction.new('CAST', [translation_json.as('jsonb')])
+                  ))
           end
+        }
+
+        define_singleton_method "arel_#{attr_name}" do |locale: I18n.locale, aliaz: nil|
+          infix = Arel::Nodes::InfixOperation.new(
+            '->',
+            arel_table["#{attr_name}#{SUFFIX}"],
+            Arel::Nodes.build_quoted(locale)
+          )
+
+          aliaz ? infix.as(aliaz.to_s) : infix
         end
+
+        scope "select_#{attr_name}", ->(aliaz: attr_name, **options) {
+          select(public_send("arel_#{attr_name}", **options, aliaz: aliaz))
+        }
+
+        scope "order_#{attr_name}", ->(direction: :asc, **options) {
+          arel = public_send("arel_#{attr_name}", **options, aliaz: nil)
+          order(direction.to_s.downcase == 'desc' ? arel.desc : arel)
+        }
       end
     end
 
